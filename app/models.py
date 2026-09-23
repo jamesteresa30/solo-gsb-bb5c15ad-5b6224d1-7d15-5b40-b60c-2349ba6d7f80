@@ -2,9 +2,14 @@
 
 from __future__ import annotations
 
+from typing import Annotated
+
 from pydantic import BaseModel, Field
 
 from .irt import THETA_MAX, THETA_MIN
+
+# JSON booleans must not sneak in as quota values; strict ints reject them.
+PositiveIntField = Annotated[int, Field(strict=True, gt=0)]
 
 
 # ---- items ----------------------------------------------------------------
@@ -70,6 +75,13 @@ class SessionCreate(BaseModel):
             "服务端按 UTC 记录截止时间，到期后 /next 与提交答案返回 409"
         ),
     )
+    tag_minimums: dict[str, PositiveIntField] = Field(
+        default_factory=dict,
+        description=(
+            "可选内容标签最低答题配额：键须为题库现有非空 content_tag，"
+            "值为正整数，所有配额之和不超过 max_items；不传则不设配额"
+        ),
+    )
 
 
 class SessionOut(BaseModel):
@@ -80,6 +92,7 @@ class SessionOut(BaseModel):
     exposure_limit: int
     duration_seconds: int | None = None
     expires_at: str | None = None
+    tag_minimums: dict[str, int] = Field(default_factory=dict)
     status: str
     finish_reason: str | None
     answered_count: int
@@ -151,6 +164,12 @@ class ProgressOut(BaseModel):
     exposure_limit: int
     duration_seconds: int | None = None
     expires_at: str | None = None
+    tag_minimums: dict[str, int] = Field(
+        default_factory=dict, description="各内容标签的最低答题配额"
+    )
+    tag_answered: dict[str, int] = Field(
+        default_factory=dict, description="各内容标签已答题数（按答题记录统计）"
+    )
     finish_reason: str | None
     current_item: ItemOut | None
     answered_item_ids: list[str]

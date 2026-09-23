@@ -7,6 +7,7 @@
 - 下一题在满足**曝光上限**的候选题中，按 **Fisher 信息量最大**选择，信息量并列时取**最小（稳定的）题目 ID**；
 - `response_id` 为客户端幂等键：**重复提交返回首次结果，不重复更新能力值、不重复计曝光**；
 - 支持可选测验时限 `duration_seconds`（60～86400 秒）：创建时按 UTC 记录截止时间 `expires_at`，到期后取题/作答原子结束会话并返回 `409`；
+- 支持可选**内容标签最低配额** `tag_minimums`：按 `content_tag` 声明本场至少要答的题数；剩余答题位仅够补缺口时只从欠额标签选题，欠额标签题量不足时以明确的 `finish_reason` 结束且不额外计曝光；
 - 提供会话进度查询与完整答题记录查询；
 - 自带 30 题确定性演示题库，容器启动后即可调用。
 
@@ -59,7 +60,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 python examples/demo.py
 ```
 
-脚本会：创建带 600 秒时限的会话（演示 `duration_seconds` 越界校验与 `expires_at`）→ 循环「取题 → 作答」5 轮 → 演示重复 `response_id` 幂等、重复 `/next` 不重复计曝光 → 打印进度与答题记录。
+脚本会：创建带 600 秒时限的会话（演示 `duration_seconds` 越界校验与 `expires_at`）→ 循环「取题 → 作答」5 轮 → 演示重复 `response_id` 幂等、重复 `/next` 不重复计曝光 → 打印进度与答题记录 → 演示 `tag_minimums` 配额选题（含配额校验、末段只从欠额标签选题、无法补齐时 `tag_minimums_unfulfillable` 结束且不增加曝光）。
 
 ## 核心算法
 
@@ -96,7 +97,29 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
 
 - 若存在「已取出但未作答」的挂起题，重复调 `/next` 返回**同一题且不重复加曝光**；
 - 已答满 `max_items` → 会话结束，`finish_reason = max_items`；
-- 没有满足曝光上限的候选题 → 结束，`finish_reason = no_available_items`。
+- 没有满足曝光上限的候选题 → 结束，`finish_reason = no_available_items`；
+- 设置了标签配额且欠额标签已无法补齐 → 结束，
+  `finish_reason = tag_minimums_unfulfillable`（见下节）。
+
+### 内容标签最低配额（可选 `tag_minimums`）
+
+- 创建会话时可传 `tag_minimums`：键必须是题库中**现有且非空的 `content_tag`**，
+  值必须为**正整数**，且所有配额之和 **不超过 `max_items`**；
+  不传或传 `{}` 表示不设配额，行为与旧版完全一致。校验失败返回 `422`。
+- 配额存入独立的 `session_tag_minimums` 表并随会话持久化；旧版本数据库在
+  服务启动时自动建表迁移（旧会话无配额行）。
+- `/next` 在原有的「未作答 + 曝光上限」候选范围内，按 `responses` 已答记录
+  统计各标签**缺口** = 配额 − 已答数：
+  - **剩余答题位 = 缺口总数**时，候选只保留欠额标签的题，再按信息量最大、
+    ID 最小的既有规则选出（保证每场测验结束时配额一定被满足）；
+  - 其余时候仍在全部候选题中选题，缺口约束只在「末段」介入。
+- 一旦发现某欠额标签的**可用题数已不足以补齐**（题已答完或达到全局曝光上限），
+  立即结束会话：`status = finished`、
+  `finish_reason = tag_minimums_unfulfillable`，`note` 给出无法满足的缺口；
+  本次**不选题、不返回题目、不增加任何曝光计数**（挂起题的幂等返回不受影响）。
+- `GET /api/sessions/{id}/progress` 返回 `tag_minimums`（配额）与
+  `tag_answered`（各标签已答数；出现过的标签与全部配额标签均会列出）。
+- 未设置配额的会话即便无题可出，仍沿用原 `no_available_items` 结束原因。
 
 ### 测验时限（可选 `duration_seconds`）
 
@@ -158,11 +181,24 @@ curl -s -X POST http://localhost:8000/api/sessions \
 # {"id":"...", "duration_seconds":600,
 #  "expires_at":"2026-09-23T08:10:00+00:00", "status":"active", ...}
 
+# 2c) 也可以在创建时声明内容标签最低配额 tag_minimums：
+#     键须为题库现有非空 content_tag，值为正整数，总和 <= max_items
+curl -s -X POST http://localhost:8000/api/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"initial_theta": 0.0, "max_items": 10,
+       "tag_minimums": {"几何": 3, "概率统计": 2}}'
+# {"id":"...", "max_items":10,
+#  "tag_minimums":{"几何":3,"概率统计":2}, "status":"active", ...}
+# 配额之和超过 max_items、值非正整数或标签不存在 -> HTTP 422
+
 # 3) 选下一题
 curl -s -X POST http://localhost:8000/api/sessions/$SID/next
 # item.id / item.stem / item.options / information / exposure_count ...
 # 若已过 expires_at：HTTP 409，
 # {"detail":"测验时限已到（UTC 截止时间 ...），会话已结束：finish_reason=time_expired"}
+# 若欠额标签已无题可补（不选题、不增加曝光）：
+# {"status":"finished","finish_reason":"tag_minimums_unfulfillable",
+#  "item":null,"note":"欠额标签的可用题数不足以补齐配额，无法满足的缺口 {...}"}
 
 # 4) 提交答案（response_id 为客户端幂等键，务必唯一）
 curl -s -X POST http://localhost:8000/api/sessions/$SID/responses \
@@ -176,11 +212,13 @@ curl -s -X POST http://localhost:8000/api/sessions/$SID/responses \
 # 6) 查询会话（含 expires_at）、进度与答题记录
 curl -s http://localhost:8000/api/sessions/$SID
 curl -s http://localhost:8000/api/sessions/$SID/progress
+# progress 还返回 "tag_minimums"（配额）与 "tag_answered"（各标签已答数）
 curl -s http://localhost:8000/api/sessions/$SID/responses
 ```
 
 重复步骤 3-4 即可完成整场测验；当 `status` 变为 `finished` 时，可从
-`finish_reason` 得知结束原因（`max_items` / `no_available_items` / `time_expired`）。
+`finish_reason` 得知结束原因（`max_items` / `no_available_items` /
+`time_expired` / `tag_minimums_unfulfillable`）。
 
 ## 环境变量
 

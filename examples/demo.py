@@ -7,7 +7,9 @@ Run with the API already listening on http://127.0.0.1:8000:
 It creates a time-limited session, runs a mini adaptive quiz, demonstrates
 idempotent retry with a repeated response_id, shows /next de-duplication,
 prints session progress and the answer history, and demonstrates the
-duration_seconds validation (60..86400).
+duration_seconds validation (60..86400).  Finally it demonstrates content-tag
+minimum quotas (``tag_minimums``), including the
+``tag_minimums_unfulfillable`` finish reason when a quota cannot be met.
 """
 
 from __future__ import annotations
@@ -167,6 +169,83 @@ def main() -> None:
 
     bank = call("GET", "/api/items?limit=3")
     show("GET /api/items?limit=3 (题库与曝光)", bank)
+
+    demo_tag_minimums()
+
+
+def demo_tag_minimums() -> None:
+    """Show tag_minimums: restricted endgame and the unfulfillable finish."""
+    # 校验：配额之和不能超过 max_items -> 422
+    expect_http_error(
+        "POST", "/api/sessions",
+        {"max_items": 3, "tag_minimums": {"算术": 2, "代数": 2}},
+    )
+    # 校验：键必须是题库现有非空 content_tag -> 422
+    expect_http_error(
+        "POST", "/api/sessions",
+        {"max_items": 3, "tag_minimums": {"不存在的标签": 1}},
+    )
+
+    # 6 道题全部要求来自「数论」：剩余答题位始终等于缺口总数，
+    # 因此每题都必须在欠额标签内按信息量/ID 规则选出。
+    session = call(
+        "POST", "/api/sessions",
+        {"max_items": 6, "exposure_limit": 50, "tag_minimums": {"数论": 6}},
+    )
+    sid = session["id"]
+    assert session["tag_minimums"] == {"数论": 6}
+    tags: list[str] = []
+    for turn in range(1, 7):
+        chosen = call("POST", f"/api/sessions/{sid}/next")
+        item = chosen["item"]
+        tags.append(item["content_tag"])
+        detail = call("GET", f"/api/items/{item['id']}")
+        call(
+            "POST", f"/api/sessions/{sid}/responses",
+            {"response_id": f"demo-tag-{sid[:8]}-{turn}",
+             "item_id": item["id"], "response": detail["answer"]},
+        )
+    progress = call("GET", f"/api/sessions/{sid}/progress")
+    show("tag_minimums 配额会话（数论 x6）", {
+        "served_tags": tags,
+        "status": progress["status"],
+        "finish_reason": progress["finish_reason"],
+        "tag_minimums": progress["tag_minimums"],
+        "tag_answered": progress["tag_answered"],
+    })
+    assert all(t == "数论" for t in tags), tags
+    assert progress["finish_reason"] == "max_items"
+
+    # 不可补齐：要求 1 道「概率统计」题（exposure_limit=1）。随后用若干
+    # 一次性配额会话把该标签题全部曝光到上限；若本库此前已跑过演示，第一
+    # 个消耗会话就会直接结束，循环同样终止（重复运行结果稳定）。
+    quota_session = call(
+        "POST", "/api/sessions",
+        {"max_items": 3, "exposure_limit": 1,
+         "tag_minimums": {"概率统计": 1}},
+    )
+    while True:
+        burner = call(
+            "POST", "/api/sessions",
+            {"max_items": 1, "exposure_limit": 1,
+             "tag_minimums": {"概率统计": 1}},
+        )
+        picked = call("POST", f"/api/sessions/{burner['id']}/next")
+        if picked["item"] is None:
+            assert picked["finish_reason"] == "tag_minimums_unfulfillable"
+            break
+        assert picked["item"]["content_tag"] == "概率统计"
+    done = call("POST", f"/api/sessions/{quota_session['id']}/next")
+    show("欠额标签已无可用题 -> 会话结束", {
+        "status": done["status"],
+        "finish_reason": done["finish_reason"],
+        "item": done["item"],
+        "note": done["note"],
+    })
+    assert done["status"] == "finished"
+    assert done["finish_reason"] == "tag_minimums_unfulfillable"
+    assert done["item"] is None, "结束时不额外选题/曝光"
+    print("  -> 欠额标签题数不足时以 tag_minimums_unfulfillable 结束，未增加曝光 ✔")
 
 
 if __name__ == "__main__":

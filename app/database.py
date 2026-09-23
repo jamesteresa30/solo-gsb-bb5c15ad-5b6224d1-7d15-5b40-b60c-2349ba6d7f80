@@ -35,9 +35,21 @@ CREATE TABLE IF NOT EXISTS sessions (
     expires_at       TEXT,    -- UTC ISO-8601 deadline (created_at + duration_seconds)
     status           TEXT NOT NULL DEFAULT 'active'
                      CHECK (status IN ('active', 'finished')),
-    finish_reason    TEXT, -- 'max_items' | 'no_available_items' | 'time_expired'
+    finish_reason    TEXT, -- 'max_items' | 'no_available_items'
+                     -- 'time_expired' | 'tag_minimums_unfulfillable'
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL
+);
+
+-- Optional per-session minimum answer quotas keyed by content tag.  A new
+-- table (created IF NOT EXISTS) also serves as the migration: databases from
+-- older versions simply acquire the table on startup and existing sessions
+-- have no rows, so their behaviour is unchanged.
+CREATE TABLE IF NOT EXISTS session_tag_minimums (
+    session_id  TEXT NOT NULL REFERENCES sessions(id),
+    content_tag TEXT NOT NULL,
+    minimum     INTEGER NOT NULL CHECK (minimum >= 1),
+    PRIMARY KEY (session_id, content_tag)
 );
 
 CREATE TABLE IF NOT EXISTS responses (
