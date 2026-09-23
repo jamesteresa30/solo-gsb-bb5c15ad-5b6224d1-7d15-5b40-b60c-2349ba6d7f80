@@ -1,0 +1,25 @@
+services:
+  quiz-api:
+    build: .
+    image: adaptive-quiz-api:latest
+    container_name: adaptive-quiz-api
+    ports:
+      - "8000:8000"
+    environment:
+      QUIZ_DB_PATH: /data/quiz.db
+      DEFAULT_EXPOSURE_LIMIT: "5"
+    volumes:
+      - quiz-data:/data
+    restart: unless-stopped
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import json,urllib.request; r=urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=3); assert json.load(r)['status']=='ok'"
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+volumes:
+  quiz-data:
