@@ -6,8 +6,9 @@ Run with the API already listening on http://127.0.0.1:8000:
 
 It creates a time-limited session, runs a mini adaptive quiz, demonstrates
 idempotent retry with a repeated response_id, shows /next de-duplication,
-prints session progress and the answer history, and demonstrates the
-duration_seconds validation (60..86400).
+prints session progress and the answer history, demonstrates the
+duration_seconds validation (60..86400), and finishes a second session that
+uses tag_minimums (per-content-tag minimum quotas).
 """
 
 from __future__ import annotations
@@ -167,6 +168,65 @@ def main() -> None:
 
     bank = call("GET", "/api/items?limit=3")
     show("GET /api/items?limit=3 (题库与曝光)", bank)
+
+    # ------------------------------------------------------------------
+    # tag_minimums: minimum per-content-tag answer counts.
+    # ------------------------------------------------------------------
+    # Invalid quotas are rejected with 422 (unknown tag / bad value / sum).
+    expect_http_error(
+        "POST", "/api/sessions",
+        {"max_items": 4, "tag_minimums": {"不存在的标签": 1}},
+    )
+    expect_http_error(
+        "POST", "/api/sessions",
+        {"max_items": 4, "tag_minimums": {"代数": 3, "几何": 2}},  # sum 5 > 4
+    )
+
+    quota = call(
+        "POST", "/api/sessions",
+        {"max_items": 4, "exposure_limit": 5,
+         "tag_minimums": {"代数": 2, "几何": 1}},
+    )
+    qid = quota["id"]
+    show("POST /api/sessions (tag_minimums)", {
+        "id": qid,
+        "tag_minimums": quota["tag_minimums"],
+    })
+    assert quota["tag_minimums"] == {"代数": 2, "几何": 1}
+
+    qprog = call("GET", f"/api/sessions/{qid}/progress")
+    assert qprog["tag_minimums"] == {"代数": 2, "几何": 1}
+    assert qprog["tag_answered"] == {}
+
+    # Run it to the end; once remaining slots equal the total deficit the
+    # pool narrows to deficient tags (note is set) and quotas are met.
+    qturn = 0
+    while True:
+        chosen = call("POST", f"/api/sessions/{qid}/next")
+        if chosen["status"] == "finished":
+            assert chosen["finish_reason"] == "max_items", chosen["finish_reason"]
+            break
+        qturn += 1
+        item = chosen["item"]
+        if chosen["note"]:
+            print(f"  -> 第 {qturn} 题起按配额收窄：{chosen['note']}")
+            assert item["content_tag"] in chosen["tag_gaps"]
+        detail = call("GET", f"/api/items/{item['id']}")
+        call(
+            "POST", f"/api/sessions/{qid}/responses",
+            {"response_id": f"quota-{qturn}-{qid[:8]}",
+             "item_id": item["id"], "response": detail["answer"]},
+        )
+
+    qprog = call("GET", f"/api/sessions/{qid}/progress")
+    show("GET .../progress (配额会话)", {
+        "status": qprog["status"],
+        "tag_minimums": qprog["tag_minimums"],
+        "tag_answered": qprog["tag_answered"],
+    })
+    assert qprog["tag_answered"].get("代数", 0) >= 2
+    assert qprog["tag_answered"].get("几何", 0) >= 1
+    print("  -> 配额已满足：代数 ≥ 2、几何 ≥ 1 ✔")
 
 
 if __name__ == "__main__":

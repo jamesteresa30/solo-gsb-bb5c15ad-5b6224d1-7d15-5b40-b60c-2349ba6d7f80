@@ -33,9 +33,11 @@ CREATE TABLE IF NOT EXISTS sessions (
     exposure_limit   INTEGER NOT NULL,
     duration_seconds INTEGER, -- optional time limit in seconds (60..86400); NULL = no limit
     expires_at       TEXT,    -- UTC ISO-8601 deadline (created_at + duration_seconds)
+    tag_minimums     TEXT,    -- optional JSON object: {content_tag: minimum answered count}
     status           TEXT NOT NULL DEFAULT 'active'
                      CHECK (status IN ('active', 'finished')),
     finish_reason    TEXT, -- 'max_items' | 'no_available_items' | 'time_expired'
+                           -- | 'tag_quota_unreachable'
     created_at       TEXT NOT NULL,
     updated_at       TEXT NOT NULL
 );
@@ -96,6 +98,8 @@ def init_db() -> None:
         # Migrate databases created before the optional session time limit.
         _ensure_column(conn, "sessions", "duration_seconds", "INTEGER")
         _ensure_column(conn, "sessions", "expires_at", "TEXT")
+        # Migrate databases created before per-session content-tag minimums.
+        _ensure_column(conn, "sessions", "tag_minimums", "TEXT")
         count = conn.execute("SELECT COUNT(*) FROM items").fetchone()[0]
         if count == 0:
             conn.executemany(

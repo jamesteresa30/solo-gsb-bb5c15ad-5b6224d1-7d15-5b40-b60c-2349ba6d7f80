@@ -70,6 +70,13 @@ class SessionCreate(BaseModel):
             "服务端按 UTC 记录截止时间，到期后 /next 与提交答案返回 409"
         ),
     )
+    tag_minimums: dict[str, int] | None = Field(
+        None,
+        description=(
+            "可选内容标签最低配额：键须为题库现有非空 content_tag，"
+            "值为正整数，所有配额之和不超过 max_items；不传或为空表示不设配额"
+        ),
+    )
 
 
 class SessionOut(BaseModel):
@@ -80,6 +87,7 @@ class SessionOut(BaseModel):
     exposure_limit: int
     duration_seconds: int | None = None
     expires_at: str | None = None
+    tag_minimums: dict[str, int] | None = None
     status: str
     finish_reason: str | None
     answered_count: int
@@ -96,6 +104,8 @@ class NextItemOut(BaseModel):
     exposure_limit: int
     answered_count: int
     max_items: int
+    tag_minimums: dict[str, int] | None = None
+    tag_gaps: dict[str, int] | None = None
     finish_reason: str | None = None
     note: str | None = None
 
@@ -151,6 +161,11 @@ class ProgressOut(BaseModel):
     exposure_limit: int
     duration_seconds: int | None = None
     expires_at: str | None = None
+    tag_minimums: dict[str, int] | None = None
+    tag_answered: dict[str, int] = Field(
+        default_factory=dict,
+        description="每个标签在本会话中已作答的题数（只统计非空 content_tag）",
+    )
     finish_reason: str | None
     current_item: ItemOut | None
     answered_item_ids: list[str]

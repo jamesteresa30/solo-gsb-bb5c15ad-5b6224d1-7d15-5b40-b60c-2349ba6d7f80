@@ -7,6 +7,7 @@
 - 下一题在满足**曝光上限**的候选题中，按 **Fisher 信息量最大**选择，信息量并列时取**最小（稳定的）题目 ID**；
 - `response_id` 为客户端幂等键：**重复提交返回首次结果，不重复更新能力值、不重复计曝光**；
 - 支持可选测验时限 `duration_seconds`（60～86400 秒）：创建时按 UTC 记录截止时间 `expires_at`，到期后取题/作答原子结束会话并返回 `409`；
+- 支持可选**内容标签最低配额** `tag_minimums`：键为题库现有非空 `content_tag`、值为正整数、配额总和不超过 `max_items`；剩余答题位只够补齐配额时仅从欠额标签选题，欠额标签题量不足则以 `tag_quota_unreachable` 结束且不额外计曝光；
 - 提供会话进度查询与完整答题记录查询；
 - 自带 30 题确定性演示题库，容器启动后即可调用。
 
@@ -98,6 +99,27 @@ ID 更小的题胜出**，因此选择结果确定可复现。题目被选中的
 - 已答满 `max_items` → 会话结束，`finish_reason = max_items`；
 - 没有满足曝光上限的候选题 → 结束，`finish_reason = no_available_items`。
 
+### 内容标签最低配额（可选 `tag_minimums`）
+
+- 创建会话时可传 `tag_minimums`：一个 `{content_tag: 最少答到的题数}` 映射。
+  - 键必须是题库中**现有且非空**的 `content_tag`（演示题库标签：`算术 / 代数 / 几何 / 概率统计 / 数论`）；
+  - 值必须是**正整数**（≥1）；
+  - 所有配额之和**不得超过 `max_items`**；不传或传 `{}` 表示不设配额，行为与旧版完全一致。
+  - 校验不通过返回 **HTTP 422**，错误信息会指明原因与题库现有标签。
+- 配额随会话持久化（`sessions.tag_minimums`，JSON），旧数据库启动时自动 `ALTER TABLE` 加列迁移，
+  并在创建响应、`GET /api/sessions/{id}`、`/progress`、`/next` 中以 `tag_minimums` 返回。
+- 每次取题都依据**已写入的作答记录**统计各标签已答数，计算缺口
+  `gap(tag) = max(0, 配额 - 已答数)`，并在 `/next` 响应中以 `tag_gaps` 返回。
+- 选题仍在原有「未作答 + 曝光上限」候选集内进行：
+  - **有冗余位时**（`max_items - 已答数 > 缺口总数`）：照常从**全部候选**中按信息量/ID 选题；
+  - **剩余答题位恰等于缺口总数**时：后续每题都必须用于补配额，候选池**收窄为欠额标签的题**，
+    仍按相同的信息量最大、ID 最小规则选择；响应 `note` 会说明本次被收窄到哪些欠额标签。
+- 进入收窄选择时，若某欠额标签满足曝光/未作答限制的可用题数**已不足以补齐自身缺口**，
+  立即结束会话，`finish_reason = tag_quota_unreachable`（`note` 列出各标签还缺几题），
+  **不选题、不增加任何曝光**。
+- 挂起题（已取未答）的重复 `/next` 幂等行为不变；进度接口额外返回 `tag_answered`
+  （每个配额标签在本会话已答的题数）。
+
 ### 测验时限（可选 `duration_seconds`）
 
 - 创建会话时可传 `duration_seconds`，取值 **60～86400 秒**；不传则无时限（行为与旧版一致）。
@@ -180,7 +202,44 @@ curl -s http://localhost:8000/api/sessions/$SID/responses
 ```
 
 重复步骤 3-4 即可完成整场测验；当 `status` 变为 `finished` 时，可从
-`finish_reason` 得知结束原因（`max_items` / `no_available_items` / `time_expired`）。
+`finish_reason` 得知结束原因（`max_items` / `no_available_items` /
+`time_expired` / `tag_quota_unreachable`）。
+
+### `tag_minimums` 调用示例
+
+```bash
+# 创建会话：4 题中至少答 2 道「代数」、1 道「几何」（配额和 3 ≤ max_items 4）
+curl -s -X POST http://localhost:8000/api/sessions \
+  -H 'Content-Type: application/json' \
+  -d '{"max_items": 4, "exposure_limit": 5,
+       "tag_minimums": {"代数": 2, "几何": 1}}'
+# {"id":"...", "max_items":4, "tag_minimums":{"代数":2,"几何":1}, "status":"active", ...}
+# 记下返回的 "id"，导出 SID=...
+
+# 非法配额会被 422 拒绝：
+#   {"代数": 1}  配额之和超过 max_items（如 {"代数":3,"几何":2} 而 max_items=4）
+#   值不是正整数（0 / 负数 / 小数）
+#   键不是题库现有非空 content_tag（如 {"不存在的标签": 1}）
+
+# 取题：响应中带 tag_gaps（当前各标签缺口）。有冗余位时从全部候选题中选；
+# 当剩余答题位 == 缺口总数时，仅从欠额标签选题并在 note 中说明：
+curl -s -X POST http://localhost:8000/api/sessions/$SID/next
+# {"item": {"id": "ITEM-002", "content_tag": "代数", ...},
+#  "tag_minimums": {"代数": 2, "几何": 1},
+#  "tag_gaps": {"代数": 2, "几何": 1},
+#  "note": "剩余答题位仅够补齐标签配额：本次仅从欠额标签 ['代数', '几何'] 中按信息量与 ID 规则选题"}
+
+# 若欠额标签的可用题数不足以补齐配额：
+# {"status": "finished", "item": null,
+#  "finish_reason": "tag_quota_unreachable",
+#  "note": "欠额标签的可用题数已不足以补齐配额（几何 缺 1），会话结束且不额外增加曝光"}
+
+# 进度接口返回配额与各标签已答数：
+curl -s http://localhost:8000/api/sessions/$SID/progress
+# {"answered_count": 3, "max_items": 4,
+#  "tag_minimums": {"代数": 2, "几何": 1},
+#  "tag_answered": {"代数": 2, "几何": 1}, ...}
+```
 
 ## 环境变量
 

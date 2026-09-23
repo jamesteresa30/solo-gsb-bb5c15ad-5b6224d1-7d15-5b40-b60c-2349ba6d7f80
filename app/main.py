@@ -179,7 +179,154 @@ def answered_count(conn: sqlite3.Connection, session_id: str) -> int:
     ).fetchone()[0]
 
 
-def serialize_session(row: sqlite3.Row, n_answered: int) -> SessionOut:
+def parse_tag_minimums(raw: str | None) -> dict[str, int] | None:
+    """Deserialise the persisted JSON quota map (``None``/empty -> no quota)."""
+    if not raw:
+        return None
+    data = json.loads(raw)
+    return data or None
+
+
+def validate_tag_minimums(
+    conn: sqlite3.Connection, body: SessionCreate
+) -> dict[str, int] | None:
+    """Validate a create-session request's ``tag_minimums`` against the bank.
+
+    Rules: absent/empty means no quota; every key must be an existing,
+    non-empty ``items.content_tag``; every value must be a positive int; the
+    quotas' sum must not exceed ``max_items``.
+    """
+    if not body.tag_minimums:
+        return None
+    minimums: dict[str, int] = {}
+    for tag, quota in body.tag_minimums.items():
+        if not isinstance(tag, str) or not tag.strip():
+            raise HTTPException(
+                status_code=422,
+                detail="tag_minimums 的键必须是题库现有非空 content_tag",
+            )
+        # bool is a subclass of int; reject it explicitly for sane errors.
+        if isinstance(quota, bool) or not isinstance(quota, int) or quota < 1:
+            raise HTTPException(
+                status_code=422,
+                detail=f"tag_minimums[{tag!r}] 必须是正整数",
+            )
+        minimums[tag] = quota
+    if sum(minimums.values()) > body.max_items:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "tag_minimums 各标签配额之和 "
+                f"{sum(minimums.values())} 超过 max_items={body.max_items}"
+            ),
+        )
+    valid_tags = {
+        r[0]
+        for r in conn.execute(
+            "SELECT DISTINCT content_tag FROM items "
+            "WHERE content_tag IS NOT NULL AND TRIM(content_tag) <> ''"
+        )
+    }
+    unknown = sorted(set(minimums) - valid_tags)
+    if unknown:
+        raise HTTPException(
+            status_code=422,
+            detail=(
+                "tag_minimums 中存在题库没有的非空 content_tag："
+                f"{unknown}；现有标签：{sorted(valid_tags)}"
+            ),
+        )
+    return minimums
+
+
+def answered_by_tag(conn: sqlite3.Connection, session_id: str) -> dict[str, int]:
+    """Count this session's responses per non-empty content tag."""
+    rows = conn.execute(
+        """
+        SELECT i.content_tag, COUNT(*)
+        FROM responses AS r
+        JOIN items AS i ON i.id = r.item_id
+        WHERE r.session_id = ?
+          AND i.content_tag IS NOT NULL AND i.content_tag <> ''
+        GROUP BY i.content_tag
+        """,
+        (session_id,),
+    ).fetchall()
+    return {r[0]: r[1] for r in rows}
+
+
+def tag_gaps(
+    conn: sqlite3.Connection,
+    session_id: str,
+    minimums: dict[str, int] | None,
+) -> dict[str, int]:
+    """Remaining deficit per tag: ``max(0, quota - answered)`` from records."""
+    if not minimums:
+        return {}
+    counts = answered_by_tag(conn, session_id)
+    return {
+        tag: max(0, quota - counts.get(tag, 0))
+        for tag, quota in minimums.items()
+    }
+
+
+def quota_selection_plan(
+    candidates: list[sqlite3.Row],
+    gaps: dict[str, int],
+    remaining_slots: int,
+) -> tuple[list[sqlite3.Row], dict[str, int], str | None]:
+    """Apply the content-tag minimum constraint to a selection.
+
+    Returns ``(pool, shortfalls, note)``:
+
+    * ``shortfalls`` is empty unless the remaining answer slots exactly
+      equal the total deficit *and* some deficient tag does not have enough
+      still-eligible items left to close its own gap; the quota can then
+      never be satisfied and the caller must finish the session without
+      adding another exposure.  Its values are the per-tag item shortfalls.
+    * Otherwise ``pool`` is the pool to select from: narrowed to items of
+      deficient tags when ``remaining_slots == total_deficit`` (every
+      remaining item must serve a quota), or the full candidate set while
+      any slack exists.  ``note`` explains a narrowed pool.
+    """
+    total_gap = sum(gaps.values())
+    if not gaps or total_gap == 0:
+        return candidates, {}, None
+
+    by_tag: dict[str, list[sqlite3.Row]] = {}
+    for row in candidates:
+        if row["content_tag"]:
+            by_tag.setdefault(row["content_tag"], []).append(row)
+
+    if remaining_slots == total_gap:
+        shortfalls = {
+            tag: gap - len(by_tag.get(tag, []))
+            for tag, gap in gaps.items()
+            if len(by_tag.get(tag, [])) < gap
+        }
+        if shortfalls:
+            return [], shortfalls, None
+        # Only tags still in deficit may enter the narrowed pool: a tag
+        # whose quota is already met must not consume one of the remaining
+        # slots (gap == 0 must be excluded explicitly).
+        deficient = {tag: gap for tag, gap in gaps.items() if gap > 0}
+        pool = [
+            row
+            for tag in deficient
+            for row in by_tag.get(tag, [])
+        ]
+        note = (
+            "剩余答题位仅够补齐标签配额：本次仅从欠额标签 "
+            f"{sorted(deficient)} 中按信息量与 ID 规则选题"
+        )
+        return pool, {}, note
+
+    return candidates, {}, None
+
+
+def serialize_session(
+    row: sqlite3.Row, n_answered: int
+) -> SessionOut:
     return SessionOut(
         id=row["id"],
         theta=row["theta"],
@@ -188,6 +335,7 @@ def serialize_session(row: sqlite3.Row, n_answered: int) -> SessionOut:
         exposure_limit=row["exposure_limit"],
         duration_seconds=row["duration_seconds"],
         expires_at=row["expires_at"],
+        tag_minimums=parse_tag_minimums(row["tag_minimums"]),
         status=row["status"],
         finish_reason=row["finish_reason"],
         answered_count=n_answered,
@@ -283,13 +431,14 @@ def create_session(
         else None
     )
     with transaction(conn):
+        tag_minimums = validate_tag_minimums(conn, body)
         conn.execute(
             """
             INSERT INTO sessions
                 (id, theta, current_item_id, max_items, exposure_limit,
-                 duration_seconds, expires_at,
+                 duration_seconds, expires_at, tag_minimums,
                  status, finish_reason, created_at, updated_at)
-            VALUES (?, ?, NULL, ?, ?, ?, ?, 'active', NULL, ?, ?)
+            VALUES (?, ?, NULL, ?, ?, ?, ?, ?, 'active', NULL, ?, ?)
             """,
             (
                 session_id,
@@ -298,6 +447,9 @@ def create_session(
                 body.exposure_limit or DEFAULT_EXPOSURE_LIMIT,
                 duration,
                 expires_at,
+                json.dumps(tag_minimums, ensure_ascii=False, sort_keys=True)
+                if tag_minimums
+                else None,
                 now,
                 now,
             ),
@@ -324,6 +476,10 @@ def session_progress(
 ) -> ProgressOut:
     session = get_session_or_404(conn, session_id)
     n_answered = answered_count(conn, session_id)
+    tag_minimums = parse_tag_minimums(session["tag_minimums"])
+    tag_answered = (
+        answered_by_tag(conn, session_id) if tag_minimums is not None else {}
+    )
     answered_ids = [
         r["item_id"]
         for r in conn.execute(
@@ -350,6 +506,8 @@ def session_progress(
         exposure_limit=session["exposure_limit"],
         duration_seconds=session["duration_seconds"],
         expires_at=session["expires_at"],
+        tag_minimums=tag_minimums,
+        tag_answered=tag_answered,
         finish_reason=session["finish_reason"],
         current_item=current_item,
         answered_item_ids=answered_ids,
@@ -397,6 +555,17 @@ def next_item(
     information at the current theta; ties break on the smallest item id, so
     the result is fully deterministic.
 
+    Content-tag minimums: when the session was created with
+    ``tag_minimums`` the per-tag deficit is recomputed from the stored
+    responses on every call.  While more answer slots remain than the total
+    deficit, selection runs over the full candidate set as usual.  Once the
+    number of remaining slots equals the total deficit, *only* items of
+    deficient tags are eligible (same information/id rules).  If a deficient
+    tag does not have enough still-eligible items left to close its quota,
+    the session is finished with ``finish_reason =
+    'tag_quota_unreachable'`` without selecting an item or adding an
+    exposure.
+
     The whole read-check-select-write sequence runs inside one serialised
     write transaction.  That way a burst of concurrent calls on the same
     session is linearised: the first selects and counts one exposure, every
@@ -424,6 +593,9 @@ def next_item(
             raise time_expired_409(expired)
 
         n_answered = answered_count(conn, session_id)
+        tag_minimums = parse_tag_minimums(session["tag_minimums"])
+        # Per-tag deficit derived from the stored response records only.
+        gaps = tag_gaps(conn, session_id, tag_minimums)
         now = utc_now()
 
         # Case 1: a served, unanswered item is pending -> return it as-is.
@@ -493,7 +665,7 @@ def next_item(
                 (session["exposure_limit"], session_id),
             ).fetchall()
 
-            # Case 4: no eligible item left -> finish.
+            # Case 4: no eligible item left at all -> finish.
             if not candidates:
                 conn.execute(
                     """UPDATE sessions
@@ -514,45 +686,83 @@ def next_item(
                     "note": "没有满足曝光上限的候选题",
                 }
 
-            # Case 5: select the maximum-information item (id tie-break),
-            # count exactly one exposure and mark it pending atomically.
             else:
-                theta = session["theta"]
-                best = min(
-                    candidates,
-                    key=lambda r: (
-                        -irt.information(
-                            theta, r["discrimination"], r["difficulty"]
+                # Apply the optional content-tag minimums: once the number
+                # of remaining answer slots equals the total per-tag
+                # deficit, the pool narrows to deficient-tag items only.
+                remaining_slots = session["max_items"] - n_answered
+                pool, shortfalls, quota_note = quota_selection_plan(
+                    candidates, gaps, remaining_slots
+                )
+
+                # Case 4b: a deficient tag lacks enough eligible items to
+                # close its quota -> finish without any extra exposure.
+                if shortfalls:
+                    detail = "; ".join(
+                        f"{tag} 缺 {short}" for tag, short in sorted(shortfalls.items())
+                    )
+                    conn.execute(
+                        """UPDATE sessions
+                           SET status = 'finished',
+                               finish_reason = 'tag_quota_unreachable',
+                               updated_at = ?
+                           WHERE id = ?""",
+                        (now, session_id),
+                    )
+                    outcome = {
+                        "status": "finished",
+                        "item_row": None,
+                        "information": None,
+                        "exposure_limit": session["exposure_limit"],
+                        "answered_count": n_answered,
+                        "max_items": session["max_items"],
+                        "finish_reason": "tag_quota_unreachable",
+                        "note": (
+                            "欠额标签的可用题数已不足以补齐配额（"
+                            f"{detail}），会话结束且不额外增加曝光"
                         ),
-                        r["id"],
-                    ),
-                )
-                info = irt.information(
-                    theta, best["discrimination"], best["difficulty"]
-                )
-                conn.execute(
-                    "UPDATE items SET exposure_count = exposure_count + 1 "
-                    "WHERE id = ?",
-                    (best["id"],),
-                )
-                conn.execute(
-                    "UPDATE sessions SET current_item_id = ?, updated_at = ? "
-                    "WHERE id = ?",
-                    (best["id"], now, session_id),
-                )
-                item_row = conn.execute(
-                    "SELECT * FROM items WHERE id = ?", (best["id"],)
-                ).fetchone()
-                outcome = {
-                    "status": "active",
-                    "item_row": item_row,
-                    "information": info,
-                    "exposure_limit": session["exposure_limit"],
-                    "answered_count": n_answered,
-                    "max_items": session["max_items"],
-                    "finish_reason": None,
-                    "note": None,
-                }
+                    }
+
+                # Case 5: select the maximum-information item (id
+                # tie-break) from the (possibly narrowed) pool, count
+                # exactly one exposure and mark it pending atomically.
+                else:
+                    theta = session["theta"]
+                    best = min(
+                        pool,
+                        key=lambda r: (
+                            -irt.information(
+                                theta, r["discrimination"], r["difficulty"]
+                            ),
+                            r["id"],
+                        ),
+                    )
+                    info = irt.information(
+                        theta, best["discrimination"], best["difficulty"]
+                    )
+                    conn.execute(
+                        "UPDATE items SET exposure_count = exposure_count + 1 "
+                        "WHERE id = ?",
+                        (best["id"],),
+                    )
+                    conn.execute(
+                        "UPDATE sessions SET current_item_id = ?, updated_at = ? "
+                        "WHERE id = ?",
+                        (best["id"], now, session_id),
+                    )
+                    item_row = conn.execute(
+                        "SELECT * FROM items WHERE id = ?", (best["id"],)
+                    ).fetchone()
+                    outcome = {
+                        "status": "active",
+                        "item_row": item_row,
+                        "information": info,
+                        "exposure_limit": session["exposure_limit"],
+                        "answered_count": n_answered,
+                        "max_items": session["max_items"],
+                        "finish_reason": None,
+                        "note": quota_note,
+                    }
 
     item_row = outcome["item_row"]
     return NextItemOut(
@@ -564,6 +774,8 @@ def next_item(
         exposure_limit=outcome["exposure_limit"],
         answered_count=outcome["answered_count"],
         max_items=outcome["max_items"],
+        tag_minimums=tag_minimums,
+        tag_gaps=gaps,
         finish_reason=outcome["finish_reason"],
         note=outcome["note"],
     )
